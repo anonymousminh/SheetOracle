@@ -1,0 +1,134 @@
+import os
+import requests
+from typing import Dict, List, Any 
+from slack_bolt import App, Say
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk import WebClient
+from data_profiler import process_and_seed_csv
+from ui_builder import build_schema_summary_card
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Initialize your app with your environment tokens
+app = App(token=os.getenv("SLACK_BOT_TOKEN"))
+
+@app.event("message")
+def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebClient):
+    # Check if the message contains any files
+    if "files" not in event:
+        return
+
+    for file_info in event["files"]:
+        file_name = file_info.get("name", "")
+        file_id = file_info.get("id")
+        download_url = file_info.get("url_private_download")
+        
+        # Intercept CSV file
+        if not file_name.endswith(".csv") or not download_url:
+            continue
+            
+        # Determine the thread timestamp to keep the analysis isolated to this thread
+        thread_ts = event.get("thread_ts", event["ts"])
+        channel_id = event["channel"]
+        
+        # 1. Immediately send an interactive UI update to the user
+        say(
+            text=f"📥 **File detected:** `{file_name}`. Initializing secure data stream...",
+            thread_ts=thread_ts
+        )
+        
+        try:
+            # 2. Authenticate and download the file from Slack's servers
+            headers = {"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN')}"}
+            response = requests.get(download_url, headers=headers, stream=True)
+            
+            if response.status_code == 200:
+                # Ensure a local temp directory exists
+                os.makedirs("./tmp_spreadsheets", exist_ok=True)
+                
+                # Save the file using the unique thread timestamp as the filename
+                # This becomes our session ID for LangGraph in Phase 3
+                target_csv_path = f"./tmp_spreadsheets/{thread_ts}.csv"
+                
+                with open(target_csv_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                # Run profiler & Database Seeding
+                total_rows, columns_metadata = process_and_seed_csv(target_csv_path, thread_ts)
+
+                # Build the UI Block Kit Presentation Card
+                ui_blocks = build_schema_summary_card(
+                    file_name=file_name,
+                    total_rows=total_rows,
+                    columns_metadata=columns_metadata
+                )
+                        
+                # 3. Inform the user that the data layer is locked in
+                client.chat_postMessage(
+                    channel=event["channel"],
+                    thread_ts=thread_ts,
+                    blocks= ui_blocks,
+                    text=f"Profile for {file_name} generated successfully"
+                )
+                print(f"Data pipeline fully wired for session thread: {thread_ts}")
+                
+            else:
+                say(text=f"❌ Failed to download file. Status code: {response.status_code}", thread_ts=thread_ts)
+                
+        except Exception as e:
+            say(text=f"⚠️ An error occurred during file ingestion: {str(e)}", thread_ts=thread_ts)
+
+# Listen for user analytics questions
+@app.event("app_mention")
+def handle_convertional_questions(event: Dict[str, Any], say: Say, client: WebClient) -> None:
+    """
+    Listen for follow-up data questions from users,
+    validates that an active SQLite session database exists for this thread,
+    and prepares the handoff to LangGraph.
+    """
+    # Extract the values from payload
+    user_question = event.get("text", "")
+    channel_id = event.get("channel", "")
+
+    # Extract the thread timestamp
+    thread_ts = event.get("thread_ts")
+
+    # Session Gatekeeper Check
+    if not thread_ts:
+        main_ts = event.get("ts", "")
+        say(
+            text="Sheetr runs inside file threads! Please upload a .csv file first then tag me inside its thread to ask questions.",
+            thread_ts=main_ts
+        )
+        return 
+    
+    # Verify if a temporary database table has already been built for this thread
+    expected_db_path = f"./tmp_spreadsheets/{thread_ts}.csv"
+
+    # 3. Perform Session validation check
+    if os.path.exists(expected_db_path):
+        print(f"[Session Approved] Mapping thread {thread_ts}")
+
+        # Keep user engaged while LangGraph is processing
+        say(
+            text="Thinking... Querying your temporary data warehouse",
+            thread_ts=thread_ts
+        )
+    
+    else:
+        say(
+            text="Dataset Context Missing: Cannot find an active spreadsheet tied to this specific thread." \
+            "Please start a new query by dropping a valid CSV file.",
+            thread_ts=thread_ts
+        )
+
+
+if __name__ == "__main__":
+    app_token = os.getenv("SLACK_APP_TOKEN")
+    if not app_token:
+        raise ValueError("Missing SLACK_APP_TOKEN")
+    # Start your app using Socket Mode Handler
+    handler = SocketModeHandler(app=app, app_token=app_token)
+    handler.start()
