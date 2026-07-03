@@ -82,7 +82,7 @@ def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebCli
 
 # Listen for user analytics questions
 @app.event("app_mention")
-def handle_convertional_questions(event: Dict[str, Any], say: Say, client: WebClient) -> None:
+def handle_conversational_questions(event: Dict[str, Any], say: Say, client: WebClient) -> None:
     """
     Listen for follow-up data questions from users,
     validates that an active SQLite session database exists for this thread,
