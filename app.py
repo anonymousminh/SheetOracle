@@ -1,14 +1,18 @@
+from json import load
 import os
 import requests
 from typing import Dict, List, Any 
 from slack_bolt import App, Say
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
-from data_profiler import process_and_seed_csv
-from ui_builder import build_schema_summary_card
 from dotenv import load_dotenv
 
 load_dotenv()
+
+from data_profiler import process_and_seed_csv
+from ui_builder import build_schema_summary_card
+from agent_graph import analytical_agent
+
 
 # Initialize your app with your environment tokens
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
@@ -48,7 +52,6 @@ def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebCli
                 os.makedirs("./tmp_spreadsheets", exist_ok=True)
                 
                 # Save the file using the unique thread timestamp as the filename
-                # This becomes our session ID for LangGraph in Phase 3
                 target_csv_path = f"./tmp_spreadsheets/{thread_ts}.csv"
                 
                 with open(target_csv_path, 'wb') as f:
@@ -109,14 +112,34 @@ def handle_conversational_questions(event: Dict[str, Any], say: Say, client: Web
 
     # 3. Perform Session validation check
     if os.path.exists(expected_db_path):
-        print(f"[Session Approved] Mapping thread {thread_ts}")
+        print(f"[Session Approved] Routing to LangGraph for thread {thread_ts}")
 
         # Keep user engaged while LangGraph is processing
         say(
-            text="Thinking... Querying your temporary data warehouse",
+            text="Thinking... Executing graped-based analytical reasoning...",
             thread_ts=thread_ts
         )
-    
+
+        try:
+            # Invoke the graph execution loop
+            final_state = analytical_agent.invoke({
+                "user_question": user_question,
+                "db_path": expected_db_path,
+                "generated_sql": "",
+                "query_result": "",
+                "error_message": "",
+                "retry_count": 0
+            })
+
+            # Extract the answer from the state
+            bot_response = final_state.get("final_response", "I encountered an error while processing your question.")
+            say(text=bot_response, thread_ts=thread_ts)
+            print(f"[Success] Successfully posted analytical answer to thread {thread_ts}")
+        except Exception as e:
+            print(f"[Error] Graph invocation failed: {str(e)}")
+            say(text=f"❌ An error occurred while processing your question: {str(e)}", thread_ts=thread_ts)
+
+
     else:
         say(
             text="Dataset Context Missing: Cannot find an active spreadsheet tied to this specific thread." \
