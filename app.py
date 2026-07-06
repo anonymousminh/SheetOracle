@@ -18,7 +18,19 @@ from agent_graph import analytical_agent
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 
 @app.event("message")
-def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebClient):
+def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebClient, context: Dict[str, Any]):
+    # Ignore messages the bot itself posted to avoid feedback loops
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return
+
+    # Fallback routing: if the bot is mentioned inside a message event
+    # (e.g. the app_mention event is not subscribed), hand off to the Q&A handler.
+    bot_user_id = context.get("bot_user_id")
+    text = event.get("text", "")
+    if bot_user_id and f"<@{bot_user_id}>" in text:
+        handle_conversational_questions(event, say, client, context)
+        return
+
     # Check if the message contains any files
     if "files" not in event:
         return
@@ -85,14 +97,18 @@ def handle_incoming_file_uploads(event: Dict[str, Any], say: Say, client: WebCli
 
 # Listen for user analytics questions
 @app.event("app_mention")
-def handle_conversational_questions(event: Dict[str, Any], say: Say, client: WebClient) -> None:
+def handle_conversational_questions(event: Dict[str, Any], say: Say, client: WebClient, context: Dict[str, Any]) -> None:
     """
     Listen for follow-up data questions from users,
     validates that an active SQLite session database exists for this thread,
     and prepares the handoff to LangGraph.
     """
-    # Extract the values from payload
-    user_question = event.get("text", "")
+    # Extract the values from payload and strip the bot mention from the question
+    raw_text = event.get("text", "")
+    bot_user_id = context.get("bot_user_id")
+    if bot_user_id:
+        raw_text = raw_text.replace(f"<@{bot_user_id}>", "")
+    user_question = raw_text.strip()
     channel_id = event.get("channel", "")
 
     # Extract the thread timestamp
@@ -108,7 +124,7 @@ def handle_conversational_questions(event: Dict[str, Any], say: Say, client: Web
         return 
     
     # Verify if a temporary database table has already been built for this thread
-    expected_db_path = f"./tmp_spreadsheets/{thread_ts}.csv"
+    expected_db_path = f"./tmp_databases/{thread_ts}.db"
 
     # 3. Perform Session validation check
     if os.path.exists(expected_db_path):
@@ -142,8 +158,7 @@ def handle_conversational_questions(event: Dict[str, Any], say: Say, client: Web
 
     else:
         say(
-            text="Dataset Context Missing: Cannot find an active spreadsheet tied to this specific thread." \
-            "Please start a new query by dropping a valid CSV file.",
+            text="No active database found for this thread. Upload a CSV file first, then ask your question here.",
             thread_ts=thread_ts
         )
 
