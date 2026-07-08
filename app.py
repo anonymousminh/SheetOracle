@@ -96,7 +96,7 @@ def _run_agent_and_reply(
     thread_ts: str,
     user_question: str,
     db_path: str,
-    status_ts: str,
+    status_ts: str | None,
 ) -> None:
     """Run the LangGraph agent in a background thread and post the result."""
     initial_state = build_initial_state(user_question, db_path)
@@ -106,21 +106,24 @@ def _run_agent_and_reply(
         for event in analytical_agent.stream(initial_state):
             for node_name, node_output in event.items():
                 accumulated.update(node_output)
-                if progress := GRAPH_NODE_PROGRESS.get(node_name):
+                if status_ts and (progress := GRAPH_NODE_PROGRESS.get(node_name)):
                     _update_progress(client, channel_id, status_ts, progress)
 
-        _clear_progress(client, channel_id, status_ts)
+        if status_ts:
+            _clear_progress(client, channel_id, status_ts)
         _post_agent_result(client, channel_id, thread_ts, accumulated)
         print(f"[Success] answered thread {thread_ts}")
 
     except Exception as exc:
         print(f"[Error] agent failed for thread {thread_ts}: {exc}")
-        _update_progress(
-            client,
-            channel_id,
-            status_ts,
-            f"An error occurred while processing your question: {exc}",
-        )
+        error_text = f"An error occurred while processing your question: {exc}"
+        if status_ts:
+            _update_progress(client, channel_id, status_ts, error_text)
+        else:
+            try:
+                client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=error_text)
+            except Exception as post_exc:
+                print(f"[Error] failed to notify user in thread {thread_ts}: {post_exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -227,15 +230,31 @@ def handle_conversational_questions(
         return
 
     print(f"[Session] routing question to agent for thread {thread_ts}")
-    status_message = client.chat_postMessage(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        text=GRAPH_NODE_PROGRESS["generate_sql"],
-    )
+
+    status_ts: str | None = None
+    try:
+        status_message = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=GRAPH_NODE_PROGRESS["generate_sql"],
+        )
+        status_ts = status_message["ts"]
+    except Exception as exc:
+        print(f"[Progress] failed to post status message: {exc}")
+        try:
+            say(
+                text=(
+                    "Working on your question... I'll post the answer here shortly. "
+                    f"(Status update failed: {exc})"
+                ),
+                thread_ts=thread_ts,
+            )
+        except Exception as say_exc:
+            print(f"[Progress] failed to notify user in thread {thread_ts}: {say_exc}")
 
     threading.Thread(
         target=_run_agent_and_reply,
-        args=(client, channel_id, thread_ts, user_question, db_path, status_message["ts"]),
+        args=(client, channel_id, thread_ts, user_question, db_path, status_ts),
         daemon=True,
     ).start()
 
