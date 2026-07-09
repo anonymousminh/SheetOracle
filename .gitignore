@@ -19,9 +19,20 @@ __pycache__/
 dist/
 build/
 
-# Runtime data (uploaded CSVs & session SQLite DBs)
+# Runtime data (uploaded CSVs, session DBs & generated charts)
 tmp_spreadsheets/
 tmp_databases/
+tmp_charts/
+
+# Test & tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
 
 # IDE & OS
 .vscode/
