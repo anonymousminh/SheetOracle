@@ -3,22 +3,38 @@ SheetOracle Slack bot.
 
 Handles CSV uploads into per-thread SQLite sessions and routes @mentions
 to the LangGraph analytical agent (SQL + optional charts + summary).
+Uses Slack AI features: loading status, thinking steps, and streamed replies.
 """
 
 import os
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 from dotenv import load_dotenv
-from slack_bolt import App, Say
+from slack_bolt import Ack, App, BoltContext, Say
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.context.set_status import SetStatus
 from slack_sdk import WebClient
 
 load_dotenv()
 
-from agent_graph import GRAPH_NODE_PROGRESS, analytical_agent, build_initial_state
+from agent_graph import analytical_agent, build_initial_state
 from data_profiler import process_and_seed_csv
+from slack_ai import (
+    FEEDBACK_ACTION_ID,
+    LOADING_MESSAGES,
+    SUGGESTED_PROMPTS,
+    advance_thinking_step,
+    build_task_order,
+    create_response_stream,
+    format_agent_response,
+    set_thread_status,
+    start_thinking_steps,
+    stream_agent_response,
+    stream_error_response,
+    upload_chart_if_present,
+)
 from ui_builder import build_schema_summary_card
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
@@ -29,101 +45,141 @@ app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 # ---------------------------------------------------------------------------
 
 
-def _update_progress(client: WebClient, channel_id: str, message_ts: str, text: str) -> None:
-    try:
-        client.chat_update(channel=channel_id, ts=message_ts, text=text)
-    except Exception as exc:
-        print(f"[Progress] update failed: {exc}")
-
-
-def _clear_progress(client: WebClient, channel_id: str, message_ts: str) -> None:
-    try:
-        client.chat_delete(channel=channel_id, ts=message_ts)
-    except Exception as exc:
-        print(f"[Progress] delete failed: {exc}")
-
-
-def _format_slack_response(
-    bot_response: str,
-    *,
-    chart_requested: bool,
-    chart_file_path: str,
-    chart_error: str,
-    chart_warning: str,
-) -> str:
-    parts = [bot_response]
-    if chart_warning:
-        parts.append(f"_{chart_warning}_")
-    if chart_requested and chart_error and not chart_file_path:
-        parts.append(f"⚠️ *Chart could not be generated:* {chart_error}")
-    return "\n\n".join(parts)
-
-
-def _post_agent_result(
-    client: WebClient,
-    channel_id: str,
-    thread_ts: str,
-    accumulated: Dict[str, Any],
-) -> None:
-    bot_response = accumulated.get(
-        "final_response",
-        "I encountered an error while processing your question.",
-    )
-    chart_file_path = accumulated.get("chart_file_path", "")
-    slack_message = _format_slack_response(
-        bot_response,
-        chart_requested=accumulated.get("chart_requested", False),
-        chart_file_path=chart_file_path,
-        chart_error=accumulated.get("chart_error", ""),
-        chart_warning=accumulated.get("chart_warning", ""),
-    )
-
-    if chart_file_path and os.path.exists(chart_file_path):
-        client.files_upload_v2(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            file=chart_file_path,
-            title="Data Visualization",
-            initial_comment=slack_message,
-        )
-    else:
-        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=slack_message)
-
-
 def _run_agent_and_reply(
     client: WebClient,
     channel_id: str,
     thread_ts: str,
     user_question: str,
     db_path: str,
-    status_ts: str | None,
+    *,
+    team_id: Optional[str],
+    user_id: Optional[str],
 ) -> None:
-    """Run the LangGraph agent in a background thread and post the result."""
+    """Run the LangGraph agent in a background thread and stream the result."""
     initial_state = build_initial_state(user_question, db_path)
     accumulated = dict(initial_state)
+    task_order = build_task_order(initial_state["chart_requested"])
+    streamer = create_response_stream(
+        client,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        team_id=team_id,
+        user_id=user_id,
+    )
 
     try:
+        start_thinking_steps(streamer, task_order)
+
         for event in analytical_agent.stream(initial_state):
             for node_name, node_output in event.items():
                 accumulated.update(node_output)
-                if status_ts and (progress := GRAPH_NODE_PROGRESS.get(node_name)):
-                    _update_progress(client, channel_id, status_ts, progress)
+                if node_name in task_order:
+                    advance_thinking_step(
+                        streamer,
+                        completed_task=node_name,
+                        task_order=task_order,
+                    )
 
-        if status_ts:
-            _clear_progress(client, channel_id, status_ts)
-        _post_agent_result(client, channel_id, thread_ts, accumulated)
+        response_text = format_agent_response(
+            accumulated.get(
+                "final_response",
+                "I encountered an error while processing your question.",
+            ),
+            chart_requested=accumulated.get("chart_requested", False),
+            chart_file_path=accumulated.get("chart_file_path", ""),
+            chart_error=accumulated.get("chart_error", ""),
+            chart_warning=accumulated.get("chart_warning", ""),
+        )
+        stream_agent_response(streamer, response_text=response_text)
+        upload_chart_if_present(
+            client,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            chart_file_path=accumulated.get("chart_file_path", ""),
+        )
         print(f"[Success] answered thread {thread_ts}")
 
     except Exception as exc:
         print(f"[Error] agent failed for thread {thread_ts}: {exc}")
-        error_text = f"An error occurred while processing your question: {exc}"
-        if status_ts:
-            _update_progress(client, channel_id, status_ts, error_text)
-        else:
-            try:
-                client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=error_text)
-            except Exception as post_exc:
-                print(f"[Error] failed to notify user in thread {thread_ts}: {post_exc}")
+        stream_error_response(
+            streamer,
+            f"An error occurred while processing your question: {exc}",
+        )
+
+
+def _handle_agent_question(
+    event: Dict[str, Any],
+    say: Say,
+    client: WebClient,
+    context: BoltContext,
+    *,
+    set_status: Optional[SetStatus] = None,
+) -> None:
+    raw_text = event.get("text", "")
+    bot_user_id = context.get("bot_user_id")
+    if bot_user_id:
+        raw_text = raw_text.replace(f"<@{bot_user_id}>", "")
+
+    user_question = raw_text.strip()
+    channel_id = event.get("channel", "")
+    thread_ts = event.get("thread_ts")
+
+    if not thread_ts:
+        say(
+            text=(
+                "SheetOracle runs inside file threads. Upload a CSV first, "
+                "then @mention me inside that thread to ask questions."
+            ),
+            thread_ts=event.get("ts", ""),
+        )
+        return
+
+    db_path = f"./tmp_databases/{thread_ts}.db"
+    if not os.path.exists(db_path):
+        say(
+            text="No active database found for this thread. Upload a CSV file first.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    if not user_question:
+        say(
+            text="Ask me a question about the uploaded spreadsheet, e.g. *What are the top expenses?*",
+            thread_ts=thread_ts,
+        )
+        return
+
+    print(f"[Session] routing question to agent for thread {thread_ts}")
+
+    if set_status:
+        set_status(
+            status="Analyzing your data...",
+            loading_messages=LOADING_MESSAGES,
+        )
+    else:
+        set_thread_status(
+            client,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            status="Analyzing your data...",
+        )
+
+    team_id = event.get("team") or context.team_id
+    user_id = event.get("user") or context.user_id
+
+    threading.Thread(
+        target=_run_agent_and_reply,
+        kwargs={
+            "client": client,
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "user_question": user_question,
+            "db_path": db_path,
+            "team_id": team_id,
+            "user_id": user_id,
+        },
+        daemon=True,
+    ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +187,34 @@ def _run_agent_and_reply(
 # ---------------------------------------------------------------------------
 
 
+@app.event("app_home_opened")
+def handle_app_home_opened(client: WebClient, event: Dict[str, Any]) -> None:
+    """Set suggested prompts when a user opens the agent DM."""
+    if event.get("tab") != "messages":
+        return
+
+    try:
+        client.assistant_threads_setSuggestedPrompts(
+            channel_id=event["channel"],
+            title="Ask SheetOracle about your data",
+            prompts=SUGGESTED_PROMPTS,
+        )
+    except Exception as exc:
+        print(f"[Slack AI] failed to set suggested prompts: {exc}")
+
+
 @app.event("message")
 def handle_incoming_file_uploads(
     event: Dict[str, Any],
     say: Say,
     client: WebClient,
-    context: Dict[str, Any],
+    context: BoltContext,
 ) -> None:
     if event.get("bot_id") or event.get("subtype") == "bot_message":
         return
 
-    bot_user_id = context.get("bot_user_id")
-    text = event.get("text", "")
-    if bot_user_id and f"<@{bot_user_id}>" in text:
-        handle_conversational_questions(event, say, client, context)
-        return
+    # @mentions are handled by app_mention only — Slack also emits a message event
+    # for the same post, which would otherwise run the agent twice.
 
     if "files" not in event:
         return
@@ -200,63 +269,49 @@ def handle_conversational_questions(
     event: Dict[str, Any],
     say: Say,
     client: WebClient,
-    context: Dict[str, Any],
+    context: BoltContext,
+    set_status: Optional[SetStatus] = None,
 ) -> None:
-    raw_text = event.get("text", "")
-    bot_user_id = context.get("bot_user_id")
-    if bot_user_id:
-        raw_text = raw_text.replace(f"<@{bot_user_id}>", "")
+    _handle_agent_question(
+        event,
+        say,
+        client,
+        context,
+        set_status=set_status,
+    )
 
-    user_question = raw_text.strip()
-    channel_id = event.get("channel", "")
-    thread_ts = event.get("thread_ts")
 
-    if not thread_ts:
-        say(
-            text=(
-                "SheetOracle runs inside file threads. Upload a CSV first, "
-                "then @mention me inside that thread to ask questions."
-            ),
-            thread_ts=event.get("ts", ""),
+@app.action(FEEDBACK_ACTION_ID)
+def handle_feedback(
+    ack: Ack,
+    body: Dict[str, Any],
+    client: WebClient,
+    context: BoltContext,
+) -> None:
+    ack()
+
+    channel_id = context.channel_id
+    user_id = context.user_id
+    message_ts = body["message"]["ts"]
+    feedback_value = body["actions"][0]["value"]
+
+    if feedback_value == "good-feedback":
+        text = "Glad that was helpful! :tada:"
+    else:
+        text = (
+            "Sorry that wasn't helpful. Try rephrasing your question or ask for a chart "
+            "to visualize the data differently."
         )
-        return
 
-    db_path = f"./tmp_databases/{thread_ts}.db"
-    if not os.path.exists(db_path):
-        say(
-            text="No active database found for this thread. Upload a CSV file first.",
-            thread_ts=thread_ts,
-        )
-        return
-
-    print(f"[Session] routing question to agent for thread {thread_ts}")
-
-    status_ts: str | None = None
     try:
-        status_message = client.chat_postMessage(
+        client.chat_postEphemeral(
             channel=channel_id,
-            thread_ts=thread_ts,
-            text=GRAPH_NODE_PROGRESS["generate_sql"],
+            user=user_id,
+            thread_ts=message_ts,
+            text=text,
         )
-        status_ts = status_message["ts"]
     except Exception as exc:
-        print(f"[Progress] failed to post status message: {exc}")
-        try:
-            say(
-                text=(
-                    "Working on your question... I'll post the answer here shortly. "
-                    f"(Status update failed: {exc})"
-                ),
-                thread_ts=thread_ts,
-            )
-        except Exception as say_exc:
-            print(f"[Progress] failed to notify user in thread {thread_ts}: {say_exc}")
-
-    threading.Thread(
-        target=_run_agent_and_reply,
-        args=(client, channel_id, thread_ts, user_question, db_path, status_ts),
-        daemon=True,
-    ).start()
+        print(f"[Slack AI] feedback response failed: {exc}")
 
 
 if __name__ == "__main__":

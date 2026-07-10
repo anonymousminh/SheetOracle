@@ -82,6 +82,15 @@ GRAPH_NODE_PROGRESS = {
     "formulate_response": "Summarizing results...",
 }
 
+
+def get_agent_task_order(chart_requested: bool) -> List[str]:
+    """Return the thinking-step task order for a given analysis run."""
+    order = ["generate_sql", "execute_sql"]
+    if chart_requested:
+        order.append("generate_chart")
+    order.append("formulate_response")
+    return order
+
 CHART_COLORS = ("#36C5F0", "#ECB22E", "#2EB67D", "#E01E5A")
 
 
@@ -157,8 +166,13 @@ def _summarize_query_result_for_prompt(query_result: Union[str, List[tuple], Any
 
     if not rows:
         return "No rows returned."
-    if len(rows) <= MAX_PROMPT_ROWS:
-        return str(rows)
+
+    row_count = len(rows)
+    if row_count == 1:
+        return f"Query returned 1 answer row: {rows[0]}"
+
+    if row_count <= MAX_PROMPT_ROWS:
+        return f"Query returned {row_count} rows: {rows}"
 
     total = len(rows)
     col_count = len(rows[0]) if isinstance(rows[0], (tuple, list)) else 1
@@ -405,6 +419,8 @@ def generate_sql_node(state: AgentState) -> Dict[str, Any]:
         "You are an elite SQL expert. Write a raw SQL query targeting a table named "
         "'uploaded_data' to answer the user's question.\n"
         f"Available columns:\n{schema_context}\n\n"
+        "When aggregating or ranking, include the computed values in SELECT "
+        "(e.g. totals, counts, averages), not just category labels.\n"
         "CRITICAL: Return ONLY the executable SQL query string. "
         "Do not use markdown backticks or explanations."
     )
@@ -478,15 +494,21 @@ def generate_chart_node(state: AgentState) -> Dict[str, str]:
 def _build_summary_prompt(
     question: str,
     data_summary: str,
+    generated_sql: str,
     chart_file_path: str,
     chart_error: str,
     chart_requested: bool,
 ) -> str:
     prompt = (
-        "You are an elite corporate financial data analyst summarizing findings for executives.\n"
-        f"Analyze this database dataset summary: {data_summary}\n"
-        f"To directly answer the user's inquiry: '{question}'\n\n"
-        "Provide a concise narrative highlighting the peaks, valleys, or key trends."
+        "You are an elite corporate financial data analyst answering a Slack user.\n"
+        f"User question: '{question}'\n\n"
+        f"SQL executed on their uploaded spreadsheet:\n{generated_sql}\n\n"
+        f"Query result (this is the computed answer — not a profile of the full dataset):\n"
+        f"{data_summary}\n\n"
+        "Answer the question directly using the query result. "
+        "If the result has one or a few rows, each row is the answer — do not claim "
+        "the spreadsheet lacks other categories or data.\n"
+        "Lead with the direct answer, then add brief context if helpful."
     )
 
     if chart_file_path:
@@ -508,6 +530,7 @@ def formulate_response_node(state: AgentState) -> Dict[str, Any]:
     prompt = _build_summary_prompt(
         question=state["user_question"],
         data_summary=_summarize_query_result_for_prompt(state["query_result"]),
+        generated_sql=state.get("generated_sql", ""),
         chart_file_path=state.get("chart_file_path", ""),
         chart_error=state.get("chart_error", ""),
         chart_requested=state.get("chart_requested", False),
