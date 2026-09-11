@@ -12,6 +12,7 @@ import ast
 import os
 import re
 import sqlite3
+import time
 from typing import Any, Dict, List, Literal, Tuple, TypedDict, Union
 
 import matplotlib
@@ -54,6 +55,9 @@ MAX_CHART_ROWS = 50
 MAX_PIE_SLICES = 10
 MAX_PROMPT_ROWS = 20
 MAX_SQL_RETRIES = 3
+MAX_RESULT_ROWS = 10_000
+MAX_QUERY_SECONDS = 20
+PROGRESS_HANDLER_INSTRUCTIONS = 10_000
 CHART_OUTPUT_DIR = "./tmp_charts"
 
 CHART_KEYWORDS = (
@@ -205,13 +209,108 @@ def _summarize_query_result_for_prompt(query_result: Union[str, List[tuple], Any
     return "\n".join(lines)
 
 
+def _connect_readonly(db_path: str) -> sqlite3.Connection:
+    """Open the session database in read-only mode.
+
+    Prevent SQL injection by activate the read-only mode at first when modifying.
+    """
+    return sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
+
+
 def _load_table_schema(db_path: str) -> str:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_readonly(db_path)
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(uploaded_data)")
     columns = cursor.fetchall()
     conn.close()
     return "\n".join(f"- {name}: {col_type}" for _, name, col_type, *_ in columns)
+
+
+# ---------------------------------------------------------------------------
+# SQL safety
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_SQL_KEYWORDS = (
+    "attach", "detach", "pragma", "vacuum", "insert", "update", "delete",
+    "drop", "alter", "create", "reindex", "begin",
+    "commit", "rollback", "savepoint", "analyze", "load_extension",
+)
+
+
+def _strip_sql_literals_and_comments(sql: str) -> str:
+    """Blank out string/identifier literals and comments for safe keyword scanning."""
+    out: List[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        if char in ("'", '"', "`"):
+            quote = char
+            index += 1
+            while index < length:
+                if sql[index] == quote:
+                    # Doubled quote is an escaped quote inside the literal.
+                    if index + 1 < length and sql[index + 1] == quote:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            out.append(" ")
+            continue
+        if char == "[":
+            while index < length and sql[index] != "]":
+                index += 1
+            index += 1
+            out.append(" ")
+            continue
+        if sql.startswith("--", index):
+            while index < length and sql[index] != "\n":
+                index += 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            out.append(" ")
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _strip_sql_fences(sql: str) -> str:
+    """Remove markdown code fences the LLM sometimes emits despite instructions."""
+    cleaned = sql.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _validate_sql(sql: str) -> str:
+    """Return a single read-only SELECT statement, or raise ValueError."""
+    cleaned = _strip_sql_fences(sql)
+    if not cleaned:
+        raise ValueError("No SQL query was generated.")
+
+    scannable = _strip_sql_literals_and_comments(cleaned)
+
+    statements = [part for part in scannable.split(";") if part.strip()]
+    if len(statements) > 1:
+        raise ValueError("Only a single SQL statement may be executed.")
+
+    normalized = scannable.strip().lstrip("(").lstrip()
+    first_word = normalized.split(None, 1)[0].lower() if normalized.split() else ""
+    if first_word not in ("select", "with"):
+        raise ValueError("Only SELECT queries are allowed.")
+
+    lowered = scannable.lower()
+    for keyword in FORBIDDEN_SQL_KEYWORDS:
+        if re.search(rf"\b{keyword}\b", lowered):
+            raise ValueError(f"Query contains a disallowed keyword: {keyword.upper()}.")
+
+    return cleaned.rstrip().rstrip(";")
 
 
 # ---------------------------------------------------------------------------
@@ -435,18 +534,31 @@ def generate_sql_node(state: AgentState) -> Dict[str, Any]:
 
 
 def execute_sql_node(state: AgentState) -> Dict[str, Any]:
+    conn = None
     try:
-        conn = sqlite3.connect(state["db_path"])
+        safe_sql = _validate_sql(state["generated_sql"])
+        conn = _connect_readonly(state["db_path"])
+
+        # Abort runaway queries (e.g. accidental cross joins) instead of hanging
+        # the Slack thread forever.
+        deadline = time.monotonic() + MAX_QUERY_SECONDS
+        conn.set_progress_handler(
+            lambda: 1 if time.monotonic() > deadline else 0,
+            PROGRESS_HANDLER_INSTRUCTIONS,
+        )
+
         cursor = conn.cursor()
-        cursor.execute(state["generated_sql"])
-        rows = cursor.fetchall()
-        conn.close()
-        return {"query_result": rows, "error_message": ""}
+        cursor.execute(safe_sql)
+        rows = cursor.fetchmany(MAX_RESULT_ROWS)
+        return {"query_result": rows, "generated_sql": safe_sql, "error_message": ""}
     except Exception as exc:
         return {
             "error_message": str(exc),
             "retry_count": state.get("retry_count", 0) + 1,
         }
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def generate_chart_node(state: AgentState) -> Dict[str, str]:

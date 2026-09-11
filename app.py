@@ -1,8 +1,8 @@
 """
 SheetOracle Slack bot.
 
-Handles CSV uploads into per-thread SQLite sessions and routes @mentions
-to the LangGraph analytical agent (SQL + optional charts + summary).
+Handles CSV uploads and Google Sheet URLs into per-thread SQLite sessions and routes
+@mentions to the LangGraph analytical agent (SQL + optional charts + summary).
 Uses Slack AI features: loading status, thinking steps, and streamed replies.
 """
 
@@ -20,7 +20,12 @@ from slack_sdk import WebClient
 load_dotenv()
 
 from agent_graph import analytical_agent, build_initial_state
-from data_profiler import process_and_seed_csv
+from data_profiler import process_and_seed_csv, process_and_seed_dataframe
+from google_sheets_mcp import (
+    GoogleSheetsMCPError,
+    extract_spreadsheet_id,
+    fetch_google_sheet_dataframe,
+)
 from slack_ai import (
     FEEDBACK_ACTION_ID,
     LOADING_MESSAGES,
@@ -127,7 +132,7 @@ def _handle_agent_question(
     if not thread_ts:
         say(
             text=(
-                "SheetOracle runs inside file threads. Upload a CSV first, "
+                "SheetOracle runs inside file threads. Upload a CSV or paste a Google Sheet URL, "
                 "then @mention me inside that thread to ask questions."
             ),
             thread_ts=event.get("ts", ""),
@@ -137,7 +142,10 @@ def _handle_agent_question(
     db_path = f"./tmp_databases/{thread_ts}.db"
     if not os.path.exists(db_path):
         say(
-            text="No active database found for this thread. Upload a CSV file first.",
+            text=(
+                "No active database found for this thread. "
+                "Upload a CSV file or paste a Google Sheet URL first."
+            ),
             thread_ts=thread_ts,
         )
         return
@@ -204,7 +212,7 @@ def handle_app_home_opened(client: WebClient, event: Dict[str, Any]) -> None:
 
 
 @app.event("message")
-def handle_incoming_file_uploads(
+def handle_incoming_messages(
     event: Dict[str, Any],
     say: Say,
     client: WebClient,
@@ -215,6 +223,42 @@ def handle_incoming_file_uploads(
 
     # @mentions are handled by app_mention only — Slack also emits a message event
     # for the same post, which would otherwise run the agent twice.
+
+    text = event.get("text", "")
+    spreadsheet_id = extract_spreadsheet_id(text)
+    if spreadsheet_id:
+        thread_ts = event.get("thread_ts", event["ts"])
+        say(
+            text="🔗 Google Sheet detected. Connecting via MCP...",
+            thread_ts=thread_ts,
+        )
+
+        try:
+            sheet_name, dataframe = fetch_google_sheet_dataframe(spreadsheet_id)
+            total_rows, columns_metadata = process_and_seed_dataframe(dataframe, thread_ts)
+            display_name = f"Google Sheet ({sheet_name})"
+            client.chat_postMessage(
+                channel=event["channel"],
+                thread_ts=thread_ts,
+                blocks=build_schema_summary_card(
+                    file_name=display_name,
+                    total_rows=total_rows,
+                    columns_metadata=columns_metadata,
+                ),
+                text=f"Profile for {display_name} generated successfully",
+            )
+            print(f"[Google Sheets MCP] session ready for thread {thread_ts}")
+        except GoogleSheetsMCPError as exc:
+            say(
+                text=(
+                    f"⚠️ Could not load Google Sheet via MCP: {exc}\n\n"
+                    "Make sure the sheet is shared with your Google service account email."
+                ),
+                thread_ts=thread_ts,
+            )
+        except Exception as exc:
+            say(text=f"⚠️ An error occurred during Google Sheet ingestion: {exc}", thread_ts=thread_ts)
+        return
 
     if "files" not in event:
         return
